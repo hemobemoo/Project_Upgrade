@@ -50,6 +50,11 @@ Open your terminal (PowerShell or CMD) in the project directory and run the foll
         ```
         .\.venv\Scripts\activate
         ```
+
+
+        ```
+        cd "C:\AIO-Steam\ECG Project\Project_V_Kimi\Project_Upgrade"
+        ```
         
     
     _(You should now see `(.venv)` appear in your terminal prompt.)_
@@ -87,8 +92,16 @@ Based on your file list, the entry point for the application is likely `app.py`.
 PowerShell
 
 ```
-python app.py
+python Copy2App.py
 ```
+
+or, for the nicegui version:
+
+```
+python cardioinsight_nicegui.py
+```
+
+
 
 
 ## 6. Initialize the Streamlit web application
@@ -97,7 +110,7 @@ python app.py
 Paste this in the cmd terminal:
 
 ```
-streamlit run app.py
+streamlit run Copy2App.py
 ```
 
 **Note:** If this is a web application (like Flask or Streamlit), the terminal will provide a URL (usually `http://127.0.0.1:5000` or similar) that you can open in your browser.
