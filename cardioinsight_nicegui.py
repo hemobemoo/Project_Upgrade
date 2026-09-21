@@ -286,8 +286,12 @@ Configuration: Edit `.env` to set model path, API key, and thresholds.""")
             state["stream_rows"] = rows
             live_dialog.close()
             box.clear()
+            n_abnormal = sum(1 for w in windows if w["anomaly_flag"])
             with box:
-                ui.html('<div class="ci-banner ci-banner-ok">✅ Streaming analysis complete.</div>')
+                if n_abnormal == 0:
+                    ui.html('<div class="ci-banner ci-banner-ok">✅ No abnormality detected - all windows NORM.</div>')
+                else:
+                    ui.html(f'<div class="ci-banner ci-banner-ok">✅ Streaming analysis complete - {n_abnormal} abnormal window(s) out of {len(windows)}.</div>')
                 ui.label("Final Stream Report").classes("text-h6 text-blue-900 q-mb-sm")
                 df_html(pd.DataFrame(rows))
                 ui.button("⬇️ Download Stream Report",
@@ -685,6 +689,14 @@ Configuration: Edit `.env` to set model path, API key, and thresholds.""")
         state["analysis_mode"] = e.value
         state["stream_running"] = False
         stream_timer.active = False
+        # Clear streaming result state to prevent stale UI and client-deleted errors
+        state["stream_abnormal"] = False
+        state["stream_abnormal_result"] = None
+        state["stream_abnormal_window"] = None
+        state["stream_rows"] = None
+        state["stream_idx"] = 0
+        state["stream_windows"] = None
+        state["stream_signal"] = None
         live_dialog.close()
         if refs.get("mode_controls") is not None:
             refs["mode_controls"].refresh()

@@ -738,18 +738,20 @@ def run_streaming_pipeline(
         signal_arr = SIG_PROC.process_for_api(window_signal)
 
         # Step 1: Binary pre-filter (fast, no metadata required)
-        if binary_model is not None:
+        binary_available = binary_model is not None
+        if binary_available:
             binary_pred, binary_conf = run_binary_inference(binary_model, signal_arr)
         else:
-            # If binary model is missing, force detailed analysis so the demo still works
-            binary_pred = 1
-            binary_conf = 1.0
+            # Binary model unavailable - do not force abnormal; full model decides per window
+            binary_pred = 0
+            binary_conf = 0.0
 
-        # Step 2: Detailed multi-label analysis only if binary flags abnormal
+        # Step 2: Detailed multi-label analysis
         if binary_pred == 1:
+            # Binary flagged abnormal - run full model for detailed diagnosis
             predictions, best_idx, probabilities = run_inference(multi_model, metadata_arr, signal_arr)
-        else:
-            # Normal window — skip heavy model, return clean NORM
+        elif binary_available:
+            # Binary said normal - skip heavy model, return clean NORM
             predictions = [
                 ("NORM", float(binary_conf), True),
                 ("MI", 0.05, False),
@@ -758,9 +760,19 @@ def run_streaming_pipeline(
                 ("HYP", 0.02, False),
             ]
             best_idx = 0
+        else:
+            # No binary model - always run full model, let it decide per window
+            predictions, best_idx, probabilities = run_inference(multi_model, metadata_arr, signal_arr)
 
         hr = estimate_heart_rate(window_signal, fs)
         heart_rhythm, rhythm_reg = estimate_rhythm_regularity(window_signal, fs)
+
+        # Anomaly flag: binary gates when available, full-model result when not
+        if binary_available:
+            anomaly_flag = binary_pred == 1
+        else:
+            has_pathology = any(is_pos and label != "NORM" for label, _, is_pos in predictions)
+            anomaly_flag = has_pathology
 
         yield {
             "window_idx": win_idx,
@@ -777,7 +789,7 @@ def run_streaming_pipeline(
             "hr": hr,
             "heart_rhythm": heart_rhythm,
             "rhythm_regularity": rhythm_reg,
-            "anomaly_flag": binary_pred == 1,
+            "anomaly_flag": anomaly_flag,
         }
 
 
