@@ -5,11 +5,13 @@ Requires the same project modules as before: api_bassam, xai_engine, ecg_engine,
 """
 
 import base64
+import html as html_lib
+import inspect
 import io
 import traceback
 import zipfile
 from functools import lru_cache
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import numpy as np
 import pandas as pd
@@ -21,7 +23,7 @@ from nicegui import ui, run                # run = nicegui's async executor (io_
 
 from api_bassam import (
     run_full_pipeline, get_model, run_batch_pipeline, run_streaming_pipeline,
-    run_streaming_window_analysis,
+    run_streaming_window_analysis, run_chunked_batch_pipeline, generate_single_report,
 )
 from xai_engine import run_xai, plot_ig_leads_final, plot_ig_metadata_final
 from settings import ECG_DISPLAY_DURATION, DEMO_MODE
@@ -58,10 +60,72 @@ def df_html(df: pd.DataFrame) -> None:
 async def _grab_upload(e) -> dict:
     """Resolve a NiceGUI upload event to {'name', 'bytes'}.
 
-    Works for both SmallFileUpload (in-memory) and LargeFileUpload (spooled
-    temp file) — reading is async, so do it here in the upload handler.
+    Version-tolerant:
+      * NiceGUI >= 3.0 -> `e.file` (SmallFileUpload / LargeFileUpload) with an async `read()`.
+      * NiceGUI 1.x/2.x -> `e.name` + `e.content` (a sync, file-like SpooledTemporaryFile).
+    Either way the raw bytes are read here, inside the upload handler, so later
+    processing never depends on a temp file that NiceGUI may already have closed.
     """
-    return {"name": e.file.name, "bytes": await e.file.read()}
+    file_obj = getattr(e, "file", None)
+    if file_obj is not None:                                   # NiceGUI 3.x
+        data = file_obj.read()
+        if inspect.isawaitable(data):
+            data = await data
+        return {"name": file_obj.name, "bytes": data}
+
+    content = e.content                                        # NiceGUI 1.x / 2.x
+    try:
+        content.seek(0)
+    except Exception:
+        pass
+    return {"name": e.name, "bytes": content.read()}
+
+
+# ── Batch input assembly (pure function: runs in a worker thread) ──────────────
+_ARRAY_EXTS = {".npy", ".mat", ".csv"}
+_WFDB_EXTS = {".hea", ".dat"}
+
+
+def build_batch_records(named_files: list, zip_bytes: bytes | None, patient: dict, fs: float):
+    """
+    Turn the uploaded files (+ optional ZIP) into records for run_chunked_batch_pipeline.
+
+      * .npy / .mat / .csv -> one record per file (carries the user-supplied sampling rate `fs`)
+      * .hea + .dat        -> paired by file stem
+    Returns (records, skipped_messages) — nothing is dropped silently.
+    """
+    entries = list(named_files)                                # [(name, bytes), ...]
+    if zip_bytes is not None:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                entries.append((info.filename, zf.read(info)))
+
+    records, skipped, wfdb = [], [], {}
+    for name, data in entries:
+        path = PurePosixPath(str(name).replace("\\", "/"))
+        if path.name.startswith(".") or "__MACOSX" in path.parts:
+            continue                                           # macOS resource-fork junk in ZIPs
+        ext = path.suffix.lower()
+        if ext in _ARRAY_EXTS:
+            records.append({"file_bytes": data, "file_name": path.name, "fs": fs, **patient})
+        elif ext in _WFDB_EXTS:
+            wfdb.setdefault((str(path.parent).lower(), path.stem.lower()), {})[ext] = (path.name, data)
+        else:
+            skipped.append(f"{path.name} (unsupported type)")
+
+    for (_, stem), pair in sorted(wfdb.items()):
+        if ".hea" in pair and ".dat" in pair:
+            records.append({
+                "hea_name": pair[".hea"][0], "hea_bytes": pair[".hea"][1],
+                "dat_name": pair[".dat"][0], "dat_bytes": pair[".dat"][1],
+                **patient,
+            })
+        else:
+            missing = ".dat" if ".hea" in pair else ".hea"
+            skipped.append(f"{stem} (missing its {missing} partner)")
+    return records, skipped
 
 
 # ── Global styles (once, at import time) ───────────────────────────────────────
@@ -133,6 +197,8 @@ def main_page() -> None:
         "results": None, "batch_results": None, "batch_rows": None,
         "manual_hea": None, "manual_dat": None,
         "batch_files": [], "batch_zip": None,
+        "batch_fs": 500, "batch_running": False,
+        "report_inflight": set(),       # (record-id, segment-id|None) keys with an LLM call in flight
         "monitor_file": None, "monitor_fs": 500,
         "stream_signal": None, "stream_windows": None,
         "stream_idx": 0, "stream_running": False, "stream_rows": None,
@@ -426,6 +492,135 @@ Configuration: Edit `.env` to set model path, API key, and thresholds.""")
 
         render_about()
 
+    # ── On-demand LLM report (batch mode) ───────────────────────────────────────
+    def _alive(el) -> bool:
+        return el is not None and not getattr(el, "is_deleted", False)
+
+    async def generate_report_for(record: dict, box, level: str, seg: dict | None = None,
+                                  button=None) -> None:
+        """
+        Populate `box` with an AI clinical report for either a whole batch
+        `record` (level="record") or one of its 10s `seg` (level="segment").
+        Called ONLY when the user clicks a "Generate AI Report" button — the
+        chunked batch pipeline itself never spends LLM tokens automatically.
+
+        The clicked button is disabled (and shows Quasar's built-in loading
+        spinner) for the whole LLM call, and an in-flight guard makes a
+        second click — even one that races the UI update — a no-op, so a
+        report can never be billed twice.
+        """
+        key = (id(record), id(seg) if level == "segment" else None)
+        if key in state["report_inflight"]:
+            return
+        state["report_inflight"].add(key)
+
+        if _alive(button):
+            button.props("loading")
+            button.disable()
+        with box:
+            status_row = ui.row().classes("items-center gap-2 no-wrap")
+            with status_row:
+                ui.spinner(size="sm", color="primary")
+                ui.label("Generating AI clinical report…").classes("text-blue-800 text-sm")
+
+        meta = record["meta"]
+        if level == "record":
+            predictions = record["predictions"]
+            hr = meta.get("hr")
+            heart_rhythm = meta.get("heart_rhythm") or (record["segments"][0]["heart_rhythm"] if record["segments"] else "—")
+            rhythm_reg = meta.get("rhythm_regularity") or (record["segments"][0]["rhythm_regularity"] if record["segments"] else "—")
+        else:
+            predictions = seg["predictions"]
+            hr = seg["heart_rate"]
+            heart_rhythm = seg["heart_rhythm"]
+            rhythm_reg = seg["rhythm_regularity"]
+
+        try:
+            report = await run.io_bound(
+                generate_single_report,
+                predictions=predictions, age=meta.get("age"), sex=meta.get("sex"),
+                hr=hr, heart_rhythm=heart_rhythm, rhythm_regularity=rhythm_reg,
+            )
+        except Exception as exc:
+            print(traceback.format_exc())
+            if _alive(box):
+                if _alive(status_row):
+                    status_row.delete()
+                if _alive(button):                       # allow a deliberate retry after a failure
+                    button.props(remove="loading")
+                    button.enable()
+                with box:
+                    ui.label(f"❌ Report generation failed: {exc}").classes("text-red-700 text-sm")
+            return
+        finally:
+            state["report_inflight"].discard(key)
+
+        if level == "record":
+            record["report"] = report
+        else:
+            seg["report"] = report
+
+        if _alive(box):                                  # the user may have switched tabs meanwhile
+            box.clear()
+            with box:
+                with ui.element("div").classes("ci-report-box w-full"):
+                    ui.html('<div class="ci-report-title">📋 AI Clinical Report</div>')
+                    ui.markdown(report)
+
+    def render_batch_record(r: dict) -> None:
+        """One expandable card per batch record: chunk timeline + on-demand reports."""
+        if r.get("status") != "success":
+            ui.html(f'<div class="ci-banner ci-banner-bad">❌ {html_lib.escape(str(r.get("filename", "unknown")))}: '
+                    f'{html_lib.escape(str(r.get("error", "processing failed")))}</div>')
+            return
+
+        with ui.expansion(f'📄 {r["filename"]} — {r["n_chunks"]} chunks, '
+                           f'{r["n_abnormal_chunks"]} abnormal', icon="description").classes("w-full"):
+            seg_rows = [{
+                "Chunk": s["chunk_index"] + 1,
+                "Time Window": s["time_window"],
+                "Prediction": ", ".join(n for n, _, p in s["predictions"] if p) or "NORM",
+                "Status": "🚨 Abnormal" if s["is_abnormal"] else "✅ Normal",
+                "HR": s["heart_rate"],
+            } for s in r["segments"]]
+            df_html(pd.DataFrame(seg_rows))
+
+            abnormal_segments = [s for s in r["segments"] if s["is_abnormal"]]
+            if abnormal_segments:
+                ui.label("Abnormal Segments").classes("text-subtitle2 text-red-700 q-mt-md")
+                for s in abnormal_segments:
+                    with ui.card().classes("w-full q-pa-sm").style("border-left:4px solid #ef4444;"):
+                        preds_txt = ", ".join(n for n, _, p in s["predictions"] if p) or "NORM"
+                        ui.label(f'{s["time_window"]} — {preds_txt} (HR {s["heart_rate"]} bpm)') \
+                            .classes("text-sm text-red-800 q-mb-xs")
+                        seg_box = ui.column().classes("w-full gap-1")
+                        if s.get("report"):
+                            with seg_box:
+                                with ui.element("div").classes("ci-report-box w-full"):
+                                    ui.markdown(s["report"])
+                        else:
+                            with seg_box:
+                                seg_btn = ui.button("📄 Generate AI Report").props(
+                                    "dense outline color=negative size=sm")
+                                seg_btn.on_click(
+                                    lambda rec=r, box=seg_box, seg=s, btn=seg_btn:
+                                        generate_report_for(rec, box, "segment", seg, btn))
+
+            ui.separator().classes("q-my-sm")
+            record_box = ui.column().classes("w-full gap-1")
+            if r.get("report"):
+                with record_box:
+                    with ui.element("div").classes("ci-report-box w-full"):
+                        ui.html('<div class="ci-report-title">📋 AI Clinical Report (full record)</div>')
+                        ui.markdown(r["report"])
+            else:
+                with record_box:
+                    rec_btn = ui.button("📄 Generate AI Clinical Report (full record)"
+                                        ).props("outline color=primary").classes("q-mt-sm")
+                    rec_btn.on_click(
+                        lambda rec=r, box=record_box, btn=rec_btn:
+                            generate_report_for(rec, box, "record", None, btn))
+
     async def render_content() -> None:
         content.clear()
         with content:
@@ -446,9 +641,19 @@ Configuration: Edit `.env` to set model path, API key, and thresholds.""")
                               on_click=lambda: ui.download(
                                   pd.DataFrame(state["batch_rows"]).to_csv(index=False).encode(),
                                   "cardioinsight_batch.csv")).props("outline").classes("q-mt-md")
+
+                    ui.label("Per-Record Timeline Detail").classes("text-h6 text-blue-900 q-mt-lg q-mb-sm")
+                    ui.label("Signal processing and model inference already ran for every chunk. "
+                             "AI clinical reports are generated on demand — click a report button below "
+                             "to spend LLM tokens only on the records/segments you actually want.") \
+                        .classes("text-grey-600 text-xs q-mb-sm")
+                    for r in state["batch_results"]:
+                        render_batch_record(r)
                 else:
                     welcome("📁", "Batch ECG Analysis",
-                            "Upload multiple .hea/.dat pairs or a ZIP archive, then run the batch analysis.")
+                            "Upload .npy / .mat / .csv recordings (set their sampling rate), WFDB .hea/.dat pairs, "
+                            "or a ZIP archive of those, then click Analyse Batch. Long recordings are "
+                            "split into 10-second chunks automatically.")
                 render_about()
             else:  # 🔁 Live Monitor
                 if state["stream_abnormal"] is True and state["stream_abnormal_result"] is not None:
@@ -490,11 +695,61 @@ Configuration: Edit `.env` to set model path, API key, and thresholds.""")
         if state["analysed"]:
             await render_content()
 
-    async def on_manual_hea(e):   state["manual_hea"] = await _grab_upload(e)
-    async def on_manual_dat(e):   state["manual_dat"] = await _grab_upload(e)
-    async def on_batch_file(e):   state["batch_files"].append(await _grab_upload(e))
-    async def on_batch_zip(e):    state["batch_zip"] = await _grab_upload(e)
-    async def on_monitor_file(e): state["monitor_file"] = await _grab_upload(e)
+    async def _safe_grab(e) -> dict | None:
+        """_grab_upload with visible error feedback — an upload handler must never fail silently."""
+        try:
+            return await _grab_upload(e)
+        except Exception as exc:
+            print(traceback.format_exc())
+            ui.notify(f"Could not read the uploaded file: {exc}", type="negative", multi_line=True)
+            return None
+
+    def _batch_status_text() -> str:
+        parts = []
+        if state["batch_files"]:
+            parts.append(f'{len(state["batch_files"])} file(s)')
+        if state["batch_zip"] is not None:
+            parts.append(f'ZIP "{state["batch_zip"]["name"]}"')
+        return ("✅ Ready: " + " + ".join(parts)) if parts else "No files loaded yet."
+
+    def _refresh_batch_status() -> None:
+        lbl = refs.get("batch_status")
+        if _alive(lbl):
+            lbl.set_text(_batch_status_text())
+
+    async def on_manual_hea(e):
+        f = await _safe_grab(e)
+        if f is not None:
+            state["manual_hea"] = f
+
+    async def on_manual_dat(e):
+        f = await _safe_grab(e)
+        if f is not None:
+            state["manual_dat"] = f
+
+    async def on_batch_file(e):
+        f = await _safe_grab(e)
+        if f is None:
+            return
+        # Re-uploading a file with the same name replaces it instead of duplicating it.
+        state["batch_files"] = [x for x in state["batch_files"] if x["name"] != f["name"]] + [f]
+        _refresh_batch_status()
+
+    async def on_batch_zip(e):
+        f = await _safe_grab(e)
+        if f is not None:
+            state["batch_zip"] = f
+            _refresh_batch_status()
+
+    async def on_monitor_file(e):
+        f = await _safe_grab(e)
+        if f is not None:
+            state["monitor_file"] = f
+
+    async def clear_batch_files() -> None:
+        state["batch_files"] = []
+        state["batch_zip"] = None
+        refs["mode_controls"].refresh()          # rebuilds the (now empty) upload widgets
 
     async def run_manual() -> None:
         errors = []
@@ -538,60 +793,111 @@ Configuration: Edit `.env` to set model path, API key, and thresholds.""")
         })
         await render_content()
 
+    def _set_batch_button_busy(busy: bool) -> None:
+        btn = refs.get("batch_btn")
+        if not _alive(btn):
+            return
+        if busy:
+            btn.props("loading")
+            btn.disable()
+        else:
+            btn.props(remove="loading")
+            btn.enable()
+
     async def run_batch() -> None:
-        records = []
-        file_map = {}
-        for f in state["batch_files"]:
-            stem = Path(f.name).stem
-            ext = Path(f.name).suffix.lower()
-            file_map.setdefault(stem, {})[ext] = f
-        for stem, pair in file_map.items():
-            if ".hea" in pair and ".dat" in pair:
-                records.append({
-                    "hea_bytes": pair[".hea"]["bytes"], "hea_name": pair[".hea"]["name"],
-                    "dat_bytes": pair[".dat"]["bytes"], "dat_name": pair[".dat"]["name"],
-                    "age": int(age_input.value) if age_input.value is not None else 50,
-                    "sex": sex_input.value,
-                    "height": height_input.value, "weight": weight_input.value,
-                })
-        if state["batch_zip"] is not None:
-            with zipfile.ZipFile(io.BytesIO(state["batch_zip"]["bytes"])) as zf:
-                names = zf.namelist()
-                for hea_name in [n for n in names if n.lower().endswith(".hea")]:
-                    dat_name = hea_name[:-4] + ".dat"
-                    if dat_name in names:
-                        records.append({
-                            "hea_bytes": zf.read(hea_name), "hea_name": Path(hea_name).name,
-                            "dat_bytes": zf.read(dat_name), "dat_name": Path(dat_name).name,
-                            "age": int(age_input.value) if age_input.value is not None else 50,
-                            "sex": sex_input.value,
-                            "height": height_input.value, "weight": weight_input.value,
-                        })
-        if not records:
-            ui.notify("No valid .hea/.dat pairs found.", type="negative")
+        """
+        Batch entry point. Every step gives visible feedback and nothing can fail
+        silently: a progress toast, a spinner panel in the results area, a
+        disabled run button, and an explicit red message for every failure mode.
+        """
+        if state["batch_running"]:
+            ui.notify("A batch analysis is already running…", type="warning")
+            return
+        if not state["batch_files"] and state["batch_zip"] is None:
+            ui.notify("Upload at least one ECG file (or a ZIP archive) first.", type="warning")
             return
 
-        spinner = ui.spinner(size="lg", color="primary")
+        state["batch_running"] = True
+        _set_batch_button_busy(True)
+        progress = ui.notification("Processing… reading uploaded files", spinner=True, timeout=None)
         try:
-            batch_results = await run.io_bound(run_batch_pipeline, records)
-        except Exception as exc:
-            ui.notify(f"Batch processing failed: {exc}", type="negative")
-            print(traceback.format_exc())
-            return
-        finally:
-            spinner.delete()
+            patient = {
+                "age": int(age_input.value) if age_input.value is not None else 50,
+                "sex": sex_input.value,
+                "height": height_input.value, "weight": weight_input.value,
+            }
+            named = [(f["name"], f["bytes"]) for f in state["batch_files"]]
+            zip_bytes = state["batch_zip"]["bytes"] if state["batch_zip"] is not None else None
 
-        rows = []
-        for r in batch_results:
-            if r["status"] == "success":
-                preds = ", ".join([n for n, _, p in r["predictions"] if p]) or "NORM"
-                rows.append({"File": r["filename"], "Prediction": preds,
-                             "HR": r["meta"]["hr"], "Status": "✅"})
+            try:
+                records, skipped = await run.io_bound(
+                    build_batch_records, named, zip_bytes, patient, float(state["batch_fs"] or 500))
+            except zipfile.BadZipFile:
+                progress.dismiss()
+                ui.notify("The ZIP archive is corrupt or not a valid ZIP file.", type="negative")
+                return
+
+            if skipped:
+                preview = ", ".join(skipped[:4]) + (f" … (+{len(skipped) - 4} more)" if len(skipped) > 4 else "")
+                ui.notify(f"Skipped {len(skipped)} file(s): {preview}", type="warning", multi_line=True)
+            if not records:
+                progress.dismiss()
+                ui.notify("No valid ECG records found. Upload .npy/.mat/.csv files or complete "
+                          ".hea + .dat pairs.", type="negative", multi_line=True)
+                return
+
+            progress.message = f"Processing {len(records)} record(s)…"
+            content.clear()
+            with content:
+                with ui.column().classes("w-full items-center q-pa-xl gap-2"):
+                    ui.spinner(size="xl", color="primary")
+                    ui.label(f"Analysing {len(records)} record(s)…").classes("text-h6 text-blue-900")
+                    ui.label("Filtering, splitting into 10-second chunks and running one batch "
+                             "inference per record (no LLM calls).").classes("text-grey-600 text-sm")
+
+            # Signal processing + inference only — NO LLM calls here, by design
+            # (see api_bassam.run_chunked_record / generate_single_report).
+            batch_results = await run.io_bound(run_chunked_batch_pipeline, records)
+
+            rows = []
+            for r in batch_results:
+                if r.get("status") == "success":
+                    preds = ", ".join([n for n, _, p in r["predictions"] if p]) or "NORM"
+                    avg_hr = r["meta"].get("hr")
+                    rows.append({
+                        "Filename": r["filename"],
+                        "Total Chunks": r["n_chunks"],
+                        "Abnormal Chunks": r["n_abnormal_chunks"],
+                        "Average HR": f"{avg_hr:.0f}" if avg_hr else "-",
+                        "Primary Diagnosis": preds,
+                    })
+                else:
+                    rows.append({
+                        "Filename": r.get("filename", "unknown"), "Total Chunks": "-",
+                        "Abnormal Chunks": "-", "Average HR": "-", "Primary Diagnosis": "Error",
+                    })
+            state["batch_results"] = batch_results
+            state["batch_rows"] = rows
+            state["report_inflight"].clear()
+
+            progress.dismiss()
+            n_err = sum(1 for r in batch_results if r.get("status") != "success")
+            if n_err == len(batch_results):
+                ui.notify("Every record failed — see the error details below.", type="negative")
+            elif n_err:
+                ui.notify(f"Done with {n_err} error(s) out of {len(batch_results)} record(s).", type="warning")
             else:
-                rows.append({"File": r["filename"], "Prediction": "Error", "HR": "-", "Status": "❌"})
-        state["batch_results"] = batch_results
-        state["batch_rows"] = rows
-        await render_content()
+                ui.notify(f"Done! Analysed {len(batch_results)} record(s).", type="positive")
+            await render_content()
+        except Exception as exc:
+            progress.dismiss()
+            print(traceback.format_exc())
+            ui.notify(f"Batch processing failed: {type(exc).__name__}: {exc}",
+                      type="negative", multi_line=True, close_button=True)
+            await render_content()                   # replaces the spinner panel
+        finally:
+            state["batch_running"] = False
+            _set_batch_button_busy(False)
 
     async def on_sample_change(e) -> None:
         state["selected_sample"] = e.value
@@ -717,15 +1023,24 @@ Configuration: Edit `.env` to set model path, API key, and thresholds.""")
                                   color="primary").classes("w-full")
                     elif mode == "📁 Batch Upload":
                         ui.label("Batch ECG Upload").classes("text-subtitle2 text-blue-900")
-                        ui.label("Upload multiple .hea/.dat pairs or a ZIP archive.").classes("text-grey-600 text-xs")
-                        ui.upload(label="Select .hea & .dat files", multiple=True, auto_upload=True,
+                        ui.label("Long continuous recordings are split into 10-second chunks. Upload "
+                                 ".npy / .mat / .csv files, .hea/.dat pairs, or a ZIP of those."
+                                 ).classes("text-grey-600 text-xs")
+                        ui.number(label="Sampling rate (Hz) — for .npy / .csv", min=50, max=2000,
+                                  value=state["batch_fs"],
+                                  on_change=lambda e: state.update(batch_fs=int(e.value or 500))
+                                  ).classes("w-full")
+                        ui.upload(label="Select ECG files", multiple=True, auto_upload=True,
                                   on_upload=on_batch_file
-                                  ).props('accept=.hea,.dat flat bordered').classes("w-full")
+                                  ).props('accept=.npy,.mat,.csv,.hea,.dat flat bordered').classes("w-full")
                         ui.upload(label="Or upload ZIP archive", auto_upload=True,
                                   on_upload=on_batch_zip
                                   ).props('accept=.zip flat bordered').classes("w-full")
-                        ui.button("🔍 Analyse Batch", on_click=run_batch,
-                                  color="primary").classes("w-full")
+                        with ui.row().classes("w-full items-center justify-between no-wrap"):
+                            refs["batch_status"] = ui.label(_batch_status_text()).classes("text-xs text-grey-700")
+                            ui.button("Clear", on_click=clear_batch_files).props("flat dense size=sm")
+                        refs["batch_btn"] = ui.button("🔍 Analyse Batch", on_click=run_batch,
+                                                      color="primary").classes("w-full")
                     else:
                         ui.label("📡 Continuous ECG Monitoring").classes("text-subtitle2 text-blue-900")
                         ui.label("Real-time ingestion → binary pre-filter → auto-routing to "
