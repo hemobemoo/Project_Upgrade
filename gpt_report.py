@@ -9,7 +9,59 @@ LABEL_FULL = {
     "HYP":  "Hypertrophy",
 }
 
-def create_system_prompt() -> str:
+LABEL_FULL_AR = {
+    "NORM": "نظم جيبي طبيعي",
+    "MI":   "احتشاء عضلة القلب",
+    "STTC": "تغيرات الموجة ST-T",
+    "CD":   "اضطراب التوصيل القلبي",
+    "HYP":  "تضخم عضلة القلب",
+}
+
+ARABIC_SYSTEM_PROMPT = """
+الٞبيايلثبنة.
+تشمل مسؤولياتك ما يلي:
+1. تفسير التشخيصات المتوقعة لتخطيط القلب.
+2. إعداد تقارير طبية احترافية.
+3. شرح الحالات القلبية بوضوح.
+4. تقديم رؤى ذات صلة سريرية.
+
+يجب أن يتضمن التقرير:
+- نظرة عامة على الحالة
+- تفسير تخطيط القلب
+- الأعراض المحتملة
+- الأهمية السريرية
+- التوصية بالمتابعة الطبية
+
+يجب أن يكون الشرح دقيقا طبيا وسهل الفهم، وأن تكتب كامل استجابتك باللغة
+العربية الفصحى، مع الحفاظ على المصطلحات الطبية الدقيقة، حتى لو كان النموذج
+قد تم ضبطه (fine-tuned) على تقارير باللغة الإنجليزية.
+
+"""
+
+ARABIC_USER_PROMPT_TEMPLATE = """
+### سياق المريض:
+- العمر: {age}
+- الجنس: {sex}
+- معدل ضربات القلب: {hr} نبضة/دقيقة
+- نظم القلب: {heart_rhythm}
+- انتظام النظم: {rhythm_regularity}
+
+### الحالات المتوقعة:
+- {diagnosis} (درجة ثقة النموذج: {confidence})
+
+### تعليمات لإعداد التقرير الطبي:
+بالاعتماد على السياق السريري والحالات المتوقعة أعلاه، أعد تقريرًا طبيًا احترافيًا.
+- ادمج معدل ضربات القلب ونظمه في تفسيرك للتشخيصات.
+- إذا كانت هناك أكثر من حالة متوقعة، اشرح العلاقة السريرية المحتملة بينها.
+- ركّز على التحليل الطبي بدلاً من درجات الثقة الرقمية.
+- نظّم التقرير وفق الهيكل التالي: 1. الملخص التشخيصي  2. الارتباط السريري
+  3. الأعراض المحتملة  4. التوصيات.
+- اكتب بأسلوب طبي احترافي وموجز، باللغة العربية الفصحى فقط.
+"""
+
+def create_system_prompt(language: str = "en") -> str:
+    if language == "ar":
+        return ARABIC_SYSTEM_PROMPT.strip()
     return """
 You are an expert cardiology AI assistant specialized in ECG interpretation.
 Your responsibilities include:
@@ -28,13 +80,21 @@ The report must include:
 The explanation must be medically accurate and easy to understand.
 """
 
-def create_user_prompt(predictions: list[tuple[str, float, bool]], meta: dict = None) -> str:
+def create_user_prompt(
+    predictions: list[tuple[str, float, bool]],
+    meta: dict = None,
+    language: str = "en",
+) -> str:
     active = [(name, prob) for name, prob, is_pos in predictions if is_pos]
     if not active:
         top = max(predictions, key=lambda x: x[1])
         active = [(top[0], top[1])]
 
-    named = [(LABEL_FULL.get(name, name), round(prob, 2)) for name, prob in active]
+    if language == "ar":
+        label_dict = LABEL_FULL_AR
+    else:
+        label_dict = LABEL_FULL
+    named = [(label_dict.get(name, name), round(prob, 2)) for name, prob in active]
 
     patient_info = ""
     if meta:
@@ -78,6 +138,7 @@ def generate_ecg_report(
     model_id: str,
     meta: dict = None,  
     temperature: float = 0.3,
+    language: str = "en",
 ) -> str:
     if not api_key or not model_id:
         raise EnvironmentError("OpenAI API key or model ID not configured.")
@@ -87,8 +148,8 @@ def generate_ecg_report(
     stream = client.chat.completions.create(
         model=model_id,
         messages=[
-            {"role": "system", "content": create_system_prompt()},
-            {"role": "user",   "content": create_user_prompt(predictions, meta)},
+            {"role": "system", "content": create_system_prompt(language=language)},
+            {"role": "user",   "content": create_user_prompt(predictions, meta, language=language)},
         ],
         stream=True,
         temperature=temperature,

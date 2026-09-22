@@ -128,6 +128,18 @@ def build_batch_records(named_files: list, zip_bytes: bytes | None, patient: dic
     return records, skipped
 
 
+# ── Language helpers ────────────────────────────────────────
+def _report_heading(kind: str, lang: str = "en") -> str:
+    """Return a report section heading in the appropriate language."""
+    headings = {
+        "stream": {"en": "Final Stream Report", "ar": "تقرير البث النهائي"},
+        "llm":   {"en": "LLM Report",          "ar": "تقرير الذكاء الاصطناعي"},
+        "clinical": {"en": "AI Clinical Report", "ar": "تقرير سريري ذكي"},
+        "clinical_full": {"en": "AI Clinical Report (full record)", "ar": "تقرير سريري ذكي (سجل كامل)"},
+    }
+    return headings.get(kind, {}).get(lang, headings.get(kind, {}).get("en", "Report"))
+
+
 # ── Global styles (once, at import time) ───────────────────────────────────────
 ui.add_head_html("""
 <style>
@@ -146,6 +158,10 @@ body, .q-card, .q-tabs { font-family: 'DM Sans', sans-serif; }
 .ci-demo { background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; padding: 0.5rem 0.8rem; font-size: 0.8rem; color: #1e40af; margin-bottom: 0.8rem; }
 
 .ci-ecg-box { border: 2px solid #fbbf24; border-radius: 12px; padding: 0.8rem 1rem; background: #fffdf0; margin-bottom: 1.2rem; }
+.ci-ecg-box[dir="rtl"], [dir="rtl"] .ci-ecg-box { direction: rtl; }
+.ci-ecg-box[dir="rtl"] { text-align: right; }
+[dir="rtl"] .ci-report-box { border-right: 2px solid #38bdf8; border-left: 2px solid transparent; }
+[dir="rtl"] .nicegui-content { direction: rtl; }
 .ci-ecg-title { color: #1d4ed8; font-weight: 600; font-size: 1rem; margin-bottom: 0.6rem; }
 .ci-report-box { border: 2px solid #38bdf8; border-radius: 12px; padding: 1.2rem 1.4rem; background: #f0f9ff; margin-bottom: 1.2rem; }
 .ci-report-title { color: #1d4ed8; font-weight: 600; font-size: 1rem; margin-bottom: 0.8rem; }
@@ -190,6 +206,7 @@ def main_page() -> None:
     # Per-client state (plain dict — replaces Streamlit session_state).
     state = {
         "analysis_mode": "Manual Upload",
+        "language": "en",
         "viz_type": "None",
         "analysed": False,
         "predictions": None, "report": None, "signal": None, "signal_arr": None,
@@ -292,7 +309,7 @@ Configuration: Edit `.env` to set model path, API key, and thresholds.""")
                     ui.html('<div class="ci-banner ci-banner-ok">✅ No abnormality detected - all windows NORM.</div>')
                 else:
                     ui.html(f'<div class="ci-banner ci-banner-ok">✅ Streaming analysis complete - {n_abnormal} abnormal window(s) out of {len(windows)}.</div>')
-                ui.label("Final Stream Report").classes("text-h6 text-blue-900 q-mb-sm")
+                ui.label(_report_heading("stream", state["language"])).classes("text-h6 text-blue-900 q-mb-sm")
                 df_html(pd.DataFrame(rows))
                 ui.button("⬇️ Download Stream Report",
                           on_click=lambda: ui.download(pd.DataFrame(rows).to_csv(index=False).encode(),
@@ -335,6 +352,7 @@ Configuration: Edit `.env` to set model path, API key, and thresholds.""")
                     window_signal=window_slice, fs=fs,
                     age=int(age_input.value) if age_input.value is not None else 50,
                     sex=sex_input.value, height=height_input.value, weight=weight_input.value,
+                    language=state["language"],
                 )
             except Exception as exc:
                 ui.notify(f"Full analysis failed: {exc}", type="negative")
@@ -456,8 +474,8 @@ Configuration: Edit `.env` to set model path, API key, and thresholds.""")
                 ui.label("💡 Tip: Switch to 'None' to view raw ECG while debugging.").classes("text-grey-600")
 
         # LLM Report
-        with ui.element("div").classes("ci-report-box w-full"):
-            ui.html('<div class="ci-report-title">📋 LLM Report</div>')
+        with _report_box():
+            ui.html(f'<div class="ci-report-title">{_report_heading("llm", state["language"])}</div>')
             ui.markdown(report)
         ui.button("⬇️ Download Report",
                   on_click=lambda: ui.download(report.encode("utf-8"), "cardioinsight_report.md")
@@ -499,6 +517,13 @@ Configuration: Edit `.env` to set model path, API key, and thresholds.""")
     # ── On-demand LLM report (batch mode) ───────────────────────────────────────
     def _alive(el) -> bool:
         return el is not None and not getattr(el, "is_deleted", False)
+
+    def _report_box():
+        """Create a report container with dir=rtl when Arabic."""
+        el = ui.element("div")
+        if state["language"] == "ar":
+            el.props("dir=rtl")
+        return el.classes("ci-report-box w-full")
 
     async def generate_report_for(record: dict, box, level: str, seg: dict | None = None,
                                   button=None) -> None:
@@ -544,6 +569,7 @@ Configuration: Edit `.env` to set model path, API key, and thresholds.""")
                 generate_single_report,
                 predictions=predictions, age=meta.get("age"), sex=meta.get("sex"),
                 hr=hr, heart_rhythm=heart_rhythm, rhythm_regularity=rhythm_reg,
+                language=state["language"],
             )
         except Exception as exc:
             print(traceback.format_exc())
@@ -567,8 +593,8 @@ Configuration: Edit `.env` to set model path, API key, and thresholds.""")
         if _alive(box):                                  # the user may have switched tabs meanwhile
             box.clear()
             with box:
-                with ui.element("div").classes("ci-report-box w-full"):
-                    ui.html('<div class="ci-report-title">📋 AI Clinical Report</div>')
+                with _report_box():
+                    ui.html(f'<div class="ci-report-title">{_report_heading("clinical", state["language"])}</div>')
                     ui.markdown(report)
 
     def render_batch_record(r: dict) -> None:
@@ -600,7 +626,7 @@ Configuration: Edit `.env` to set model path, API key, and thresholds.""")
                         seg_box = ui.column().classes("w-full gap-1")
                         if s.get("report"):
                             with seg_box:
-                                with ui.element("div").classes("ci-report-box w-full"):
+                                with _report_box():
                                     ui.markdown(s["report"])
                         else:
                             with seg_box:
@@ -614,8 +640,8 @@ Configuration: Edit `.env` to set model path, API key, and thresholds.""")
             record_box = ui.column().classes("w-full gap-1")
             if r.get("report"):
                 with record_box:
-                    with ui.element("div").classes("ci-report-box w-full"):
-                        ui.html('<div class="ci-report-title">📋 AI Clinical Report (full record)</div>')
+                    with _report_box():
+                        ui.html(f'<div class="ci-report-title">{_report_heading("clinical_full", state["language"])}</div>')
                         ui.markdown(r["report"])
             else:
                 with record_box:
@@ -673,6 +699,8 @@ Configuration: Edit `.env` to set model path, API key, and thresholds.""")
                     await render_results(state["stream_abnormal_result"])
                     return
                 box = ui.column().classes("w-full gap-2")
+                if state["language"] == "ar":
+                    box.props("dir=rtl")
                 state["monitor_box"] = box
                 if state["stream_running"] or state["stream_abnormal"] == "pending":
                     with box:
@@ -782,6 +810,7 @@ Configuration: Edit `.env` to set model path, API key, and thresholds.""")
                 dat_bytes=state["manual_dat"]["bytes"], dat_name=state["manual_dat"]["name"],
                 age=int(age_input.value), sex=sex_input.value,
                 height=height_input.value, weight=weight_input.value,
+                language=state["language"],
             )
         except Exception as exc:
             ui.notify(f"Analysis failed: {exc}", type="negative")
@@ -956,6 +985,7 @@ Configuration: Edit `.env` to set model path, API key, and thresholds.""")
                 age=int(age_input.value) if age_input.value is not None else 50,
                 sex=sex_input.value, height=height_input.value, weight=weight_input.value,
                 window_sec=10.0, overlap_sec=5.0,
+                language=state["language"],
             )))
         except Exception as exc:
             ui.notify(f"Failed to start stream: {exc}", type="negative")
@@ -989,7 +1019,11 @@ Configuration: Edit `.env` to set model path, API key, and thresholds.""")
         await render_content()
 
     # ── Layout: fixed left | scrollable right ──────────────────────────────────
-    with ui.row().classes("w-full items-start no-wrap q-mt-md gap-lg"):
+    _main_row = ui.row().classes("w-full items-start no-wrap q-mt-md gap-lg")
+    if state["language"] == "ar":
+        _main_row.props("dir=rtl")
+    refs["main_row"] = _main_row
+    with _main_row:
         # ── LEFT: control panel ──────────────────────────────────────────────────
         with ui.column().classes("ci-left gap-3"):
             with ui.card().classes("w-full q-pa-md"):
@@ -1000,6 +1034,22 @@ Configuration: Edit `.env` to set model path, API key, and thresholds.""")
 
                 ui.radio(["Manual Upload", "📁 Batch Upload", "🔁 Live Monitor"],
                          value="Manual Upload", on_change=on_mode_change).props("inline dense")
+
+                async def _on_language_change(e):
+                    state["language"] = e.value
+                    main_row = refs.get("main_row")
+                    if main_row is not None:
+                        if state["language"] == "ar":
+                            main_row.props("dir=rtl").update()
+                        else:
+                            main_row.props("dir=ltr").update()
+                    await render_content()
+
+                _lang_row = ui.row().classes("w-full items-center no-wrap q-gutter-sm q-mb-sm")
+                with _lang_row:
+                    ui.label("Report Language").classes("text-subtitle2 text-blue-900")
+                    ui.radio({"en": "English", "ar": "العربية"},
+                             value=state["language"], on_change=_on_language_change).props("inline dense")
 
                 ui.separator().classes("q-my-sm")
                 ui.label("Patient Information").classes("text-subtitle2 text-blue-900")

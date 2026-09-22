@@ -418,6 +418,7 @@ def run_full_pipeline(
     sex: str,
     height: float | None = None,
     weight: float | None = None,
+    language: str = "en",
 ) -> dict:
 
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -441,6 +442,7 @@ def run_full_pipeline(
             model_id=FINE_TUNED_MODEL,
             temperature=REPORT_TEMPERATURE,
             meta={"age": age, "sex": sex, "hr": hr, "heart_rhythm": heart_rhythm, "rhythm_regularity": rhythm_reg},
+            language=language,
         )
     except Exception as exc:
         log.warning("LLM report generation failed: %s. Using fallback.", exc)
@@ -489,7 +491,7 @@ def run_full_pipeline(
 
 # ── Batch pipeline ────────────────────────────────────────────────────────────
 
-def run_batch_pipeline(records: list[dict]) -> list[dict]:
+def run_batch_pipeline(records: list[dict], language: str = "en") -> list[dict]:
     """
     Process multiple ECG records.
     records: list of dicts with keys: hea_bytes, hea_name, dat_bytes, dat_name, age, sex, height, weight
@@ -498,7 +500,7 @@ def run_batch_pipeline(records: list[dict]) -> list[dict]:
     results = []
     for rec in records:
         try:
-            result = run_full_pipeline(**rec)
+            result = run_full_pipeline(**rec, language=language)
             result["status"] = "success"
             result["filename"] = rec["hea_name"]
         except Exception as exc:
@@ -685,6 +687,7 @@ def generate_single_report(
     hr: float | None,
     heart_rhythm: str = "—",
     rhythm_regularity: str = "—",
+    language: str = "en",
 ) -> str:
     """
     Generate ONE clinical narrative report on demand for a chosen record or a
@@ -700,6 +703,7 @@ def generate_single_report(
             model_id=FINE_TUNED_MODEL,
             temperature=REPORT_TEMPERATURE,
             meta=meta,
+            language=language,
         )
     except Exception as exc:
         log.warning("On-demand LLM report generation failed: %s. Using fallback.", exc)
@@ -717,6 +721,7 @@ def run_streaming_pipeline(
     weight: float | None = None,
     window_sec: float = 10.0,
     overlap_sec: float = 5.0,
+    language: str = "en",
 ):
     """
     Real-time streaming pipeline:
@@ -790,6 +795,7 @@ def run_streaming_pipeline(
             "heart_rhythm": heart_rhythm,
             "rhythm_regularity": rhythm_reg,
             "anomaly_flag": anomaly_flag,
+            "language": language,
         }
 
 
@@ -802,6 +808,7 @@ def run_streaming_window_analysis(
     sex: str,
     height: float | None = None,
     weight: float | None = None,
+    language: str = "en",
 ) -> dict:
     """
     Run the same full-result pipeline used for Manual Upload (multi-label
@@ -829,6 +836,7 @@ def run_streaming_window_analysis(
             model_id=FINE_TUNED_MODEL,
             temperature=REPORT_TEMPERATURE,
             meta={"age": age, "sex": sex, "hr": hr, "heart_rhythm": heart_rhythm, "rhythm_regularity": rhythm_reg},
+            language=language,
         )
     except Exception as exc:
         log.warning("LLM report generation failed: %s. Using fallback.", exc)
