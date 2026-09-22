@@ -690,10 +690,13 @@ Configuration: Edit `.env` to set model path, API key, and thresholds.""")
                     # Abnormal window detected: show alert + full pipeline results
                     # in the same layout/format as Manual Upload.
                     w = state["stream_abnormal_window"]
+                    _bc = w.get("binary_conf", 0)
+                    if _bc == 0.0 and w.get("predictions"):
+                        _bc = max(p for _, p, _ in w["predictions"])
                     ui.html(
                         '<div class="ci-banner ci-banner-bad" style="font-size:1rem;font-weight:600;">'
                         f'🚨 STREAM STOPPED — Abnormal rhythm detected at {w["start_sec"]:.1f}s-{w["end_sec"]:.1f}s '
-                        f'(binary pre-filter confidence: {w.get("binary_conf", 0):.2%})</div>'
+                        f'(binary pre-filter confidence: {_bc:.2%})</div>'
                     )
                     ui.button("🔁 Reset Live Monitor", on_click=reset_stream_alert).props("outline").classes("q-mb-md")
                     await render_results(state["stream_abnormal_result"])
